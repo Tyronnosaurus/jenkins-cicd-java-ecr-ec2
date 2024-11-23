@@ -1,0 +1,132 @@
+#!/usr/bin/env groovy
+
+pipeline {
+    agent any
+    
+    tools {
+        maven 'maven-3.9'  // Must be the one configured in Jenkins tools 
+    }
+
+    environment {
+        KEY_PATH = "/var/jenkins_home/.ssh/key.pem"     // Key to connect to EC2 instance (must be created manually)
+    }
+
+    stages {
+
+        // Builds the Java app into a jar file.
+        // We also "clean" so that any previous jars are deleted. This way the Dockerfile can just look for "java-maven-app-*.jar" without the need to specify the actual filename. 
+        stage('build app') {
+            steps {
+                script {
+                    echo 'building the application...'
+                    sh 'mvn clean package'
+                }
+            }
+        }
+
+        // Prepare a string with the name of the image we want to build (e.g. dockerhubuser/appname:1.1.14-18)
+        stage('Prepare image name') {
+            steps {
+                script {
+                    echo 'Preparing the image name...'
+                    withCredentials([usernamePassword(credentialsId: 'dockerhub-credentials', usernameVariable: 'USER', passwordVariable: 'PASS')]) {
+                        env.DOCKER_REPO = "${USER}/java-maven-app"
+                    }
+
+                    // Use a version parser to check the application version from the pom.xml file
+                    echo 'Checking app version and preparing name of the image...'
+                    def matcher = readFile('pom.xml') =~ '<version>(.+)</version>'
+                    def version = matcher[0][1]
+                    env.IMAGE_VERSION = "$version-$BUILD_NUMBER"  // Combine the app version with the job build index (e.g. 1.1.14-18)
+
+                    env.DOCKER_IMAGE = "${DOCKER_REPO}:${IMAGE_VERSION}"
+                    echo "The image name is ${DOCKER_IMAGE}"
+                }
+            }
+        }
+        
+
+
+        // Using the built jar, create an image based on the Dockerfile
+        stage('build image') {
+            steps {
+                script {
+                    echo "building the docker image..."
+                    sh "docker build -t ${DOCKER_IMAGE} ."
+                }
+            }
+        }
+
+        // Push image to repository (Docker Hub)
+        stage('Push Docker Image to Docker Hub') {
+            steps {
+                script {
+                    // Login to Docker Hub
+                    withCredentials([usernamePassword(credentialsId: 'dockerhub-credentials', usernameVariable: 'USER', passwordVariable: 'PASS')]) {
+                        sh "echo $PASS | docker login -u $USER --password-stdin"
+                    }
+                    
+                    sh "docker push ${DOCKER_IMAGE}"    // Push the Docker image
+                    sh "docker logout"   // Logout of Docker Hub for security
+                }
+            }
+        }
+
+        // Use Terraform to create an EC2 instance (if it doesn't exist already), and when finished save its ID and IP.
+        stage('Provision EC2 with Terraform') {
+            steps {
+                script {
+                    // The repo has been cloned in "/var/jenkins_home/workspace/java-app-EC2/" and the pipeline uses it as its work directory.
+                    // We need to enter the 'terraform' folder as it is where we've put all our version-controlled Terraform files. 
+                    dir('terraform') {
+                        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-credentials-id']]) {
+                            sh 'terraform init'
+                            sh 'terraform apply -auto-approve'
+                        }
+                        
+                        
+                        // Retrieve instance ID from the Terraform outputs
+                        env.INSTANCE_ID = sh(script: "terraform output -raw instance_id", returnStdout: true).trim()
+                        env.PUBLIC_IP = sh(script: "terraform output -raw public_ip", returnStdout: true).trim()
+                        echo "Provisioned EC2 instance with ID ${INSTANCE_ID} and public IP ${PUBLIC_IP}"
+                    }
+
+                    // Ensure Docker is installed in the EC2 instance
+                    sh """
+                    ssh -o StrictHostKeyChecking=no -i "${KEY_PATH}" ec2-user@${PUBLIC_IP} '
+                        sudo yum update -y &&
+                        sudo yum install docker -y &&
+                        sudo service docker start &&
+                        sudo systemctl enable docker &&
+                        sudo usermod -aG docker ec2-user
+                    '
+                    """
+                }
+            }
+        }
+
+        // Deploy Docker image on Dockerhub to the EC2 instance we just provisioned
+        stage('Deploy Docker Image on EC2') {
+            steps {
+                script {
+                    echo "Deploying Docker image ${DOCKER_IMAGE} on EC2 instance with IP: ${PUBLIC_IP}"
+
+                    // Remove previous container(s) by filtering with the image name without the version
+                    sh """
+                    ssh -o StrictHostKeyChecking=no -i "${KEY_PATH}" ec2-user@${PUBLIC_IP} '
+                        docker ps -a | grep "${DOCKER_REPO}:*" | awk \'{ print \$1 }\' | xargs -r docker stop
+                        docker ps -a | grep "${DOCKER_REPO}:*" | awk \'{ print \$1 }\' | xargs -r docker rm
+                    '
+                    """
+
+                    // Pull and run Docker image on EC2
+                    sh """
+                    ssh -o StrictHostKeyChecking=no -i "${KEY_PATH}" ec2-user@${PUBLIC_IP} 'docker pull ${DOCKER_IMAGE}'
+                    ssh -o StrictHostKeyChecking=no -i "${KEY_PATH}" ec2-user@${PUBLIC_IP} 'docker run -d -p 8080:8080 ${DOCKER_IMAGE} '
+                    """
+                }
+            }
+        }
+
+    }
+}
